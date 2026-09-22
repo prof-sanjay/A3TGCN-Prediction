@@ -1,1 +1,9 @@
-datasets
+# Python
+__pycache__/
+*.pyc
+
+# Results
+results/
+
+# Datasets (if you don't want them in Git)
+datasets/
