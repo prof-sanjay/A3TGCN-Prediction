@@ -3,9 +3,9 @@
 import sys
 import os
 
-base_dir = os.path.abspath(
-    os.path.join(os.path.dirname(__file__),
-                 "..", "T-GCN", "T-GCN-TensorFlow")
+base_dir = os.path.join(
+    os.path.dirname(__file__),
+    "T-GCN-TensorFlow"
 )
 
 sys.path.append(base_dir)   
@@ -177,7 +177,7 @@ sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
 sess.run(tf.global_variables_initializer())
 
 #out = 'out/%s'%(model_name)
-out = 'Without Validation/outpems/%s'%(model_name)
+out = 'Without_Validation/static/%s'%(model_name)
 path1 = '%s_%s_lr%r_batch%r_unit%r_seq%r_pre%r_trsample%r_epoch%r'%(model_name,data_name,lr,batch_size,gru_units,seq_len,pre_len,train_rate,training_epoch)
 path = os.path.join(out,path1)
 if not os.path.exists(path):
