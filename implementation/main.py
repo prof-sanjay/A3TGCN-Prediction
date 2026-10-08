@@ -1,13 +1,59 @@
+"""
+E0 / E1 / E2 ablation runner for A3T-GCN on LargeST-GBA 2021.
+
+    E0 : A3T-GCN on the road-network adjacency.
+    E1 : A3T-GCN on the topology-aware VAR graph.
+    E2 : A3T-GCN on the VAR + PEM probabilistic causal graph.
+
+Only the graph differs between E0, E1 and E2. Everything else
+(data, split, preprocessing, missing-value policy, model, training,
+validation, checkpointing, metrics) is shared via ExperimentConfig.
+
+The E1 / E2 graphs are built OFFLINE from the TRAINING split only
+(VAR: run_var.py, PEM: run_local_pem.py) and passed in as an .npz
+graph artifact with the keys:
+
+    adjacency   float array (num_nodes, num_nodes)
+    experiment  "E1" or "E2"
+    train_end   number of training timesteps used to build the graph
+    num_nodes   number of sensors
+
+VAR and PEM are therefore never executed inside this process, and
+E0 cannot use them by construction.
+
+Missing values are NOT imputed. A window is used only when every
+traffic value in its input and target is finite.
+
+Run from the repository root:
+
+    python -m implementation.main --experiment E0
+    python -m implementation.main --experiment E2 --graph <graph.npz>
+"""
+
+import argparse
+import json
 import os
+import time
+from dataclasses import asdict
+from pathlib import Path
+
 import numpy as np
 import tensorflow.compat.v1 as tf
 
 tf.disable_v2_behavior()
 
+from .config.config import ExperimentConfig
+
+from .data.loader import load_gba_dataset
+from .data.splitting import chronological_split
 from .data.preprocessing import (
     fit_max_scaler,
     normalize_data,
-    create_sequences,
+)
+from .data.windows import (
+    valid_window_starts,
+    iterate_window_batches,
+    missing_value_report,
 )
 
 from .models.a3tgcn import A3TGCNModel
@@ -21,336 +67,110 @@ from .training.metrics import (
     accuracy,
 )
 
-from .causal.var import TopologyAwareVAR
-from .causal.causal_units import build_causal_units
-from .causal.local_pem import LocalPEM
-
-
-# ============================================================
-# Configuration
-# ============================================================
-
-SEED = 42
-
-SEQ_LEN = 12
-PRE_LEN = 1
-
-GRU_UNITS = 100
-
-LEARNING_RATE = 0.005
-TRAINING_EPOCH = 20
-BATCH_SIZE = 8
-
-TRAIN_RATE = 0.8
-VAL_RATE = 0.1
-TEST_RATE = 0.1
-
-LAMBDA_LOSS = 0.0015
-
-# VAR
-VAR_LAG_ORDER = 1
-VAR_RIDGE_ALPHA = 1e-5
-
-# PEM
-PEM_THRESHOLD = 0.5
-
-# LR scheduler
-LR_PATIENCE = 5
-LR_FACTOR = 0.5
-LR_MIN = 1e-5
-
-# Checkpoint
-CHECKPOINT_DIR = "results/e2_checkpoints"
-
 
 # ============================================================
 # Reproducibility
 # ============================================================
 
-np.random.seed(SEED)
-tf.set_random_seed(SEED)
+def set_seeds(seed):
+
+    np.random.seed(seed)
+    tf.set_random_seed(seed)
 
 
 # ============================================================
-# Data utilities
+# Graph selection (the only E0 / E1 / E2 difference)
 # ============================================================
 
-def chronological_split(data):
+def graph_statistics(adjacency):
     """
-    Chronological 80/10/10 split.
-
-    No shuffling is performed.
-    """
-
-    n = len(data)
-
-    train_end = int(n * TRAIN_RATE)
-    val_end = int(n * (TRAIN_RATE + VAL_RATE))
-
-    train_data = data[:train_end]
-    val_data = data[train_end:val_end]
-    test_data = data[val_end:]
-
-    return train_data, val_data, test_data
-
-
-def filter_valid_sequences(X, y):
-    """
-    Remove sequences containing non-finite values.
-
-    No imputation is performed.
+    Summary statistics of the graph given to A3T-GCN.
     """
 
-    X_valid = np.all(np.isfinite(X), axis=(1, 2))
-    y_valid = np.all(np.isfinite(y), axis=(1, 2))
+    off_diagonal = adjacency.copy()
+    np.fill_diagonal(off_diagonal, 0.0)
 
-    valid_mask = X_valid & y_valid
+    edges = off_diagonal != 0
+    weights = off_diagonal[edges]
 
-    return X[valid_mask], y[valid_mask]
+    num_nodes = adjacency.shape[0]
 
-
-# ============================================================
-# Data loading
-# ============================================================
-
-def load_dataset():
-
-    traffic_path = os.path.join(
-        os.path.dirname(__file__),
-        "datasets",
-        "LargeST GBA",
-        "gba_his_raw_2021.h5",
-    )
-
-    adjacency_path = os.path.join(
-        os.path.dirname(__file__),
-        "datasets",
-        "LargeST GBA",
-        "gba_rn_adj.npy",
-    )
-
-    print("=" * 70)
-    print("E2: VAR + PEM + A3T-GCN")
-    print("=" * 70)
-
-    print("\nLoading traffic data...")
-
-    import h5py
-
-    with h5py.File(traffic_path, "r") as f:
-        traffic = f["traffic"][:]
-
-    adjacency = np.load(adjacency_path)
-
-    print(f"Traffic shape : {traffic.shape}")
-    print(f"Adjacency shape : {adjacency.shape}")
-    print(f"Traffic dtype : {traffic.dtype}")
-    print(f"Adjacency dtype : {adjacency.dtype}")
-
-    return traffic, adjacency
+    return {
+        "num_nodes": int(num_nodes),
+        "num_edges_off_diagonal": int(edges.sum()),
+        "density_off_diagonal": float(
+            edges.sum() / (num_nodes * (num_nodes - 1))
+        ),
+        "num_self_loops": int(np.count_nonzero(np.diag(adjacency))),
+        "num_reciprocal_pairs": int((edges & edges.T).sum() // 2),
+        "isolated_nodes": int(
+            np.sum(~edges.any(axis=0) & ~edges.any(axis=1))
+        ),
+        "is_symmetric": bool(np.array_equal(adjacency, adjacency.T)),
+        "weight_min": float(weights.min()) if weights.size else 0.0,
+        "weight_mean": float(weights.mean()) if weights.size else 0.0,
+        "weight_max": float(weights.max()) if weights.size else 0.0,
+    }
 
 
-# ============================================================
-# E2 causal graph
-# ============================================================
+def load_graph(config, road_adjacency, train_end):
+    """
+    Return the adjacency matrix used by A3T-GCN.
 
-def build_e2_causal_graph(train_data, adjacency):
+    E0:
+        Road-network adjacency, unchanged.
 
-    print("\n")
-    print("=" * 70)
-    print("E2 CAUSAL GRAPH")
-    print("=" * 70)
+    E1 / E2:
+        Offline graph artifact. Its metadata must show that it was
+        built from exactly this training split.
+    """
 
-    print("\nStep 1: Topology-aware VAR")
+    if config.experiment == "E0":
 
-    var_model = TopologyAwareVAR(
-        lag_order=VAR_LAG_ORDER,
-        ridge_alpha=VAR_RIDGE_ALPHA,
-        use_gpu=True,
-    )
+        return np.asarray(road_adjacency, dtype=np.float32), {
+            "source": "road_adjacency",
+            "path": config.adjacency_path,
+        }
 
-    var_result = var_model.fit(
-        train_data,
-        adjacency,
-    )
+    with np.load(config.graph_path, allow_pickle=False) as artifact:
 
-    print("\nVAR completed.")
+        adjacency = np.asarray(
+            artifact["adjacency"],
+            dtype=np.float32,
+        )
 
-    print(
-        "Coefficient shape :",
-        var_result.coefficients.shape,
-    )
+        graph_experiment = str(artifact["experiment"])
+        graph_train_end = int(artifact["train_end"])
+        graph_num_nodes = int(artifact["num_nodes"])
 
-    print(
-        "Residual shape :",
-        var_result.residuals.shape,
-    )
+    if graph_experiment != config.experiment:
+        raise ValueError(
+            f"Graph artifact was built for {graph_experiment}, "
+            f"but the run is {config.experiment}."
+        )
 
-    print(
-        "Valid residuals :",
-        np.sum(var_result.valid_mask),
-    )
+    if graph_train_end != train_end:
+        raise ValueError(
+            "Graph artifact was not built from this training split: "
+            f"train_end {graph_train_end} != {train_end}."
+        )
 
-    # --------------------------------------------------------
-    # Step 2: Build topology-aware causal units
-    # --------------------------------------------------------
-
-    print("\nStep 2: Building causal units")
-
-    units = build_causal_units(
-        adjacency
-    )
-
-    unit_sizes = np.array(
-        [len(unit.nodes) for unit in units],
-        dtype=np.int32,
-    )
-
-    print(
-        f"Number of causal units : {len(units)}"
-    )
-
-    print(
-        f"Unit size min           : {unit_sizes.min()}"
-    )
-
-    print(
-        f"Unit size median        : {np.median(unit_sizes):.1f}"
-    )
-
-    print(
-        f"Unit size mean          : {unit_sizes.mean():.2f}"
-    )
-
-    print(
-        f"Unit size max           : {unit_sizes.max()}"
-    )
-
-    # --------------------------------------------------------
-    # Step 3: Local PEM
-    # --------------------------------------------------------
-
-    print("\nStep 3: Local PEM")
-
-    pem_model = LocalPEM(
-        units=units,
-        threshold=PEM_THRESHOLD,
-    )
-
-    pem_result = pem_model.fit(
-        var_result.residuals
-    )
-
-    print("\nPEM completed.")
-
-    print(
-        "Processed units :",
-        pem_result.processed_units,
-    )
-
-    # --------------------------------------------------------
-    # Step 4: Construct probabilistic directed graph
-    # --------------------------------------------------------
-    #
-    # global_inclusion_probabilities:
-    #
-    #     symmetric pairwise inclusion probability
-    #
-    # global_adjacency:
-    #
-    #     directed PEM-LBN adjacency
-    #
-    # Convention:
-    #
-    #     adjacency[target, source] = 1
-    #
-    # Therefore:
-    #
-    #     source ---> target
-    #
-    # Multiplying the two gives a directed graph whose
-    # magnitude represents PEM inclusion probability.
-    # --------------------------------------------------------
-
-    print("\nStep 4: Constructing probabilistic causal graph")
-
-    probability_matrix = (
-        pem_result.global_inclusion_probabilities
-    )
-
-    directed_matrix = (
-        pem_result.global_adjacency
-    )
-
-    causal_graph = (
-        probability_matrix * directed_matrix
-    )
-
-    np.fill_diagonal(
-        causal_graph,
-        0.0,
-    )
-
-    causal_graph = np.asarray(
-        causal_graph,
-        dtype=np.float32,
-    )
-
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
-
-    print(
-        "Causal graph shape :",
-        causal_graph.shape,
-    )
-
-    print(
-        "Finite graph :",
-        np.all(np.isfinite(causal_graph)),
-    )
-
-    print(
-        "Non-zero causal edges :",
-        np.count_nonzero(causal_graph),
-    )
-
-    print(
-        "Minimum edge weight :",
-        causal_graph.min(),
-    )
-
-    print(
-        "Maximum edge weight :",
-        causal_graph.max(),
-    )
-
-    return causal_graph
-
-
-# ============================================================
-# Batch generation
-# ============================================================
-
-def iterate_batches(X, y, batch_size):
-
-    n = len(X)
-
-    for start in range(
-        0,
-        n,
-        batch_size,
+    if adjacency.shape != road_adjacency.shape or (
+        graph_num_nodes != road_adjacency.shape[0]
     ):
-
-        end = min(
-            start + batch_size,
-            n,
+        raise ValueError(
+            f"Graph shape {adjacency.shape} does not match "
+            f"{road_adjacency.shape}."
         )
 
-        yield (
-            X[start:end],
-            y[start:end],
-        )
+    if not np.all(np.isfinite(adjacency)):
+        raise ValueError("Graph artifact contains non-finite values.")
+
+    return adjacency, {
+        "source": f"{config.experiment}_artifact",
+        "path": str(config.graph_path),
+        "train_end": graph_train_end,
+    }
 
 
 # ============================================================
@@ -360,17 +180,20 @@ def iterate_batches(X, y, batch_size):
 def predict_dataset(
     trainer,
     model,
-    X,
-    y,
+    data,
+    starts,
+    config,
 ):
 
     predictions = []
     targets = []
 
-    for X_batch, y_batch in iterate_batches(
-        X,
-        y,
-        BATCH_SIZE,
+    for X_batch, y_batch in iterate_window_batches(
+        data,
+        starts,
+        config.seq_len,
+        config.pre_len,
+        config.batch_size,
     ):
 
         feed_dict = {
@@ -421,178 +244,209 @@ def predict_dataset(
 # Main
 # ============================================================
 
+def parse_args():
+
+    parser = argparse.ArgumentParser(
+        description="E0 / E1 / E2 A3T-GCN ablation on LargeST-GBA."
+    )
+
+    parser.add_argument(
+        "--experiment",
+        choices=["E0", "E1", "E2"],
+        default="E0",
+    )
+
+    parser.add_argument(
+        "--graph",
+        default=None,
+        help="Graph artifact (.npz) for E1 / E2.",
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override training_epoch (smoke tests only).",
+    )
+
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Output folder under results/ (default: experiment).",
+    )
+
+    return parser.parse_args()
+
+
 def main():
 
-    print("DEBUG: main.py loaded")
-    print("DEBUG: starting E2")
+    args = parse_args()
+
+    config = ExperimentConfig(
+        experiment=args.experiment,
+        graph_path=args.graph,
+    )
+
+    if args.epochs is not None:
+        config.training_epoch = args.epochs
+
+    config.validate()
+
+    run_dir = Path(config.results_dir) / (
+        args.run_name or config.experiment
+    )
+
+    checkpoint_path = str(run_dir / "checkpoints" / "best_model")
+
+    os.makedirs(run_dir / "checkpoints", exist_ok=True)
+
+    set_seeds(config.seed)
+
+    results = {
+        "experiment": config.experiment,
+        "run_dir": str(run_dir),
+        "config": asdict(config),
+        "epochs_overridden": args.epochs is not None,
+    }
+
+    print("=" * 70)
+    print(f"{config.experiment}: A3T-GCN ABLATION RUN")
+    print("=" * 70)
 
     # --------------------------------------------------------
-    # Load data
+    # Load data (float32, NaNs preserved)
     # --------------------------------------------------------
 
-    traffic, road_adjacency = load_dataset()
+    print("\nLoading traffic data...")
+
+    traffic, road_adjacency = load_gba_dataset(
+        config.traffic_path,
+        config.adjacency_path,
+        num_timesteps=config.num_timesteps,
+        num_nodes=config.num_nodes,
+    )
 
     num_nodes = traffic.shape[1]
 
-    print(
-        f"\nNumber of nodes : {num_nodes}"
-    )
+    print(f"Traffic shape   : {traffic.shape} {traffic.dtype}")
+    print(f"Adjacency shape : {road_adjacency.shape}")
 
     # --------------------------------------------------------
     # Chronological split
     # --------------------------------------------------------
 
-    print("\nSplitting data chronologically...")
-
-    train_data, val_data, test_data = (
-        chronological_split(traffic)
+    train_data, val_data, test_data = chronological_split(
+        traffic,
+        config.train_rate,
+        config.val_rate,
     )
 
-    print(
-        "Train shape :",
-        train_data.shape,
-    )
+    train_end = len(train_data)
+    val_end = train_end + len(val_data)
+
+    results["split"] = {
+        "train_rows": [0, train_end],
+        "val_rows": [train_end, val_end],
+        "test_rows": [val_end, len(traffic)],
+    }
 
     print(
-        "Validation shape :",
-        val_data.shape,
-    )
-
-    print(
-        "Test shape :",
-        test_data.shape,
+        f"\nSplit rows: train [0, {train_end}), "
+        f"val [{train_end}, {val_end}), "
+        f"test [{val_end}, {len(traffic)})"
     )
 
     # --------------------------------------------------------
-    # E2 causal graph
-    #
-    # IMPORTANT:
-    # VAR + PEM use TRAIN DATA ONLY.
+    # Missing-value statistics (raw data, nothing modified)
     # --------------------------------------------------------
 
-    causal_graph = build_e2_causal_graph(
-        train_data,
+    results["missing_values"] = {
+        name: missing_value_report(
+            split,
+            config.seq_len,
+            config.pre_len,
+        )
+        for name, split in [
+            ("train", train_data),
+            ("val", val_data),
+            ("test", test_data),
+        ]
+    }
+
+    for name, report in results["missing_values"].items():
+        print(
+            f"{name:5s}: missing {report['missing_values']} "
+            f"({report['missing_percentage']:.4f}%), "
+            f"valid windows {report['valid_windows']} / "
+            f"{report['total_windows']}"
+        )
+
+    # --------------------------------------------------------
+    # Graph (the only difference between E0 / E1 / E2)
+    # --------------------------------------------------------
+
+    adjacency, graph_info = load_graph(
+        config,
         road_adjacency,
+        train_end,
     )
 
+    graph_info["statistics"] = graph_statistics(adjacency)
+    results["graph"] = graph_info
+
+    print(f"\nGraph source : {graph_info['source']}")
+    print(f"Graph stats  : {graph_info['statistics']}")
+
     # --------------------------------------------------------
-    # Fit scaler on TRAIN data only
+    # Fit scaler on TRAIN data only, then normalize.
+    #
+    # The whole array is divided once and the splits are views,
+    # which gives exactly the same values as normalizing each
+    # split separately while avoiding extra copies.
     # --------------------------------------------------------
 
-    print("\nFitting scaler on training data...")
+    max_value = fit_max_scaler(train_data)
 
-    max_value = fit_max_scaler(
-        train_data
-    )
+    print(f"\nTraining max value : {max_value}")
 
-    print(
-        "Training max value :",
+    del train_data, val_data, test_data
+
+    traffic_norm = normalize_data(
+        traffic,
         max_value,
     )
 
-    # --------------------------------------------------------
-    # Normalize all splits using training scaler
-    # --------------------------------------------------------
+    del traffic
 
-    train_norm = normalize_data(
-        train_data,
-        max_value,
+    train_norm, val_norm, test_norm = chronological_split(
+        traffic_norm,
+        config.train_rate,
+        config.val_rate,
     )
 
-    val_norm = normalize_data(
-        val_data,
-        max_value,
-    )
-
-    test_norm = normalize_data(
-        test_data,
-        max_value,
-    )
+    results["max_value"] = max_value
 
     # --------------------------------------------------------
-    # Create sequences
+    # Valid windows (no imputation, windows with NaN excluded)
     # --------------------------------------------------------
 
-    print("\nCreating training sequences...")
-
-    X_train, y_train = create_sequences(
-        train_norm,
-        SEQ_LEN,
-        PRE_LEN,
+    train_starts = valid_window_starts(
+        train_norm, config.seq_len, config.pre_len
+    )
+    val_starts = valid_window_starts(
+        val_norm, config.seq_len, config.pre_len
+    )
+    test_starts = valid_window_starts(
+        test_norm, config.seq_len, config.pre_len
     )
 
-    print(
-        "Raw train sequences:",
-        X_train.shape,
-        y_train.shape,
-    )
+    results["valid_sequences"] = {
+        "train": int(len(train_starts)),
+        "val": int(len(val_starts)),
+        "test": int(len(test_starts)),
+    }
 
-    print("\nCreating validation sequences...")
-
-    X_val, y_val = create_sequences(
-        val_norm,
-        SEQ_LEN,
-        PRE_LEN,
-    )
-
-    print(
-        "Raw validation sequences:",
-        X_val.shape,
-        y_val.shape,
-    )
-
-    print("\nCreating test sequences...")
-
-    X_test, y_test = create_sequences(
-        test_norm,
-        SEQ_LEN,
-        PRE_LEN,
-    )
-
-    print(
-        "Raw test sequences:",
-        X_test.shape,
-        y_test.shape,
-    )
-
-    # --------------------------------------------------------
-    # Remove sequences containing NaN / Inf
-    # --------------------------------------------------------
-
-    X_train, y_train = filter_valid_sequences(
-        X_train,
-        y_train,
-    )
-
-    X_val, y_val = filter_valid_sequences(
-        X_val,
-        y_val,
-    )
-
-    X_test, y_test = filter_valid_sequences(
-        X_test,
-        y_test,
-    )
-
-    print("\nValid sequences:")
-
-    print(
-        "Train:",
-        X_train.shape,
-        y_train.shape,
-    )
-
-    print(
-        "Validation:",
-        X_val.shape,
-        y_val.shape,
-    )
-
-    print(
-        "Test:",
-        X_test.shape,
-        y_test.shape,
-    )
+    print(f"\nValid sequences : {results['valid_sequences']}")
 
     # --------------------------------------------------------
     # TensorFlow graph
@@ -601,59 +455,38 @@ def main():
     tf.reset_default_graph()
 
     # Re-establish reproducibility after graph reset.
-    np.random.seed(SEED)
-    tf.set_random_seed(SEED)
+    set_seeds(config.seed)
 
     print("\nBuilding A3T-GCN model...")
 
     model = A3TGCNModel(
-        seq_len=SEQ_LEN,
+        seq_len=config.seq_len,
         num_nodes=num_nodes,
-        gru_units=GRU_UNITS,
-        pre_len=PRE_LEN,
-        adjacency=causal_graph,
-        lambda_loss=LAMBDA_LOSS,
+        gru_units=config.gru_units,
+        pre_len=config.pre_len,
+        adjacency=adjacency,
+        lambda_loss=config.lambda_loss,
     )
-
-    # --------------------------------------------------------
-    # Trainer
-    # --------------------------------------------------------
 
     trainer = A3TGCNTrainer(
         loss=model.loss,
-        learning_rate=LEARNING_RATE,
+        learning_rate=config.learning_rate,
         optimizer="adam",
     )
 
     trainer.initialize()
 
-    # --------------------------------------------------------
-    # Validation LR scheduler
-    # --------------------------------------------------------
-
     scheduler = ValidationLRScheduler(
-        initial_lr=LEARNING_RATE,
-        patience=LR_PATIENCE,
-        factor=LR_FACTOR,
-        min_lr=LR_MIN,
-    )
-
-    # --------------------------------------------------------
-    # Checkpoint directory
-    # --------------------------------------------------------
-
-    os.makedirs(
-        CHECKPOINT_DIR,
-        exist_ok=True,
-    )
-
-    checkpoint_path = os.path.join(
-        CHECKPOINT_DIR,
-        "best_model",
+        initial_lr=config.learning_rate,
+        patience=config.lr_patience,
+        factor=config.lr_factor,
+        min_lr=config.lr_min,
     )
 
     best_val_rmse = float("inf")
     best_epoch = -1
+
+    history = []
 
     # --------------------------------------------------------
     # Training
@@ -664,20 +497,20 @@ def main():
     print("A3T-GCN TRAINING")
     print("=" * 70)
 
-    for epoch in range(
-        TRAINING_EPOCH
-    ):
+    training_start = time.perf_counter()
+
+    for epoch in range(config.training_epoch):
+
+        epoch_start = time.perf_counter()
 
         batch_losses = []
 
-        # ----------------------------------------------------
-        # Training batches
-        # ----------------------------------------------------
-
-        for X_batch, y_batch in iterate_batches(
-            X_train,
-            y_train,
-            BATCH_SIZE,
+        for X_batch, y_batch in iterate_window_batches(
+            train_norm,
+            train_starts,
+            config.seq_len,
+            config.pre_len,
+            config.batch_size,
         ):
 
             feed_dict = {
@@ -685,12 +518,8 @@ def main():
                 model.labels: y_batch,
             }
 
-            batch_loss = trainer.train_batch(
-                feed_dict
-            )
-
             batch_losses.append(
-                batch_loss
+                trainer.train_batch(feed_dict)
             )
 
         train_loss = (
@@ -706,35 +535,24 @@ def main():
         val_targets, val_predictions = predict_dataset(
             trainer,
             model,
-            X_val,
-            y_val,
+            val_norm,
+            val_starts,
+            config,
         )
 
-        val_rmse = rmse(
-            val_targets,
-            val_predictions,
-        )
-
-        val_mae = mae(
-            val_targets,
-            val_predictions,
-        )
+        val_rmse = rmse(val_targets, val_predictions)
+        val_mae = mae(val_targets, val_predictions)
 
         # ----------------------------------------------------
         # Scheduler
         # ----------------------------------------------------
 
-        current_lr = scheduler.step(
-            val_rmse
-        )
+        current_lr = scheduler.step(val_rmse)
 
-        trainer.set_learning_rate(
-            current_lr
-        )
+        trainer.set_learning_rate(current_lr)
 
         # ----------------------------------------------------
-        # Save BEST model using validation RMSE
-        #
+        # Save BEST model using validation RMSE.
         # Test data is NOT used here.
         # ----------------------------------------------------
 
@@ -743,9 +561,7 @@ def main():
             best_val_rmse = val_rmse
             best_epoch = epoch
 
-            trainer.save(
-                checkpoint_path,
-            )
+            trainer.save(checkpoint_path)
 
             checkpoint_status = " * BEST"
 
@@ -753,14 +569,36 @@ def main():
 
             checkpoint_status = ""
 
+        epoch_seconds = time.perf_counter() - epoch_start
+
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_rmse": float(val_rmse),
+            "val_mae": float(val_mae),
+            "val_rmse_original": float(val_rmse * max_value),
+            "val_mae_original": float(val_mae * max_value),
+            "learning_rate": float(current_lr),
+            "seconds": epoch_seconds,
+        })
+
         print(
-            f"Epoch {epoch + 1:03d}/{TRAINING_EPOCH} | "
+            f"Epoch {epoch + 1:03d}/{config.training_epoch} | "
             f"Loss {train_loss:.6f} | "
             f"Val RMSE {val_rmse:.6f} | "
             f"Val MAE {val_mae:.6f} | "
-            f"LR {current_lr:.8f}"
+            f"LR {current_lr:.8f} | "
+            f"{epoch_seconds:.0f}s"
             f"{checkpoint_status}"
         )
+
+    training_seconds = time.perf_counter() - training_start
+
+    results["history"] = history
+    results["training_seconds"] = training_seconds
+    results["best_epoch"] = best_epoch + 1
+    results["best_val_rmse"] = float(best_val_rmse)
+    results["best_val_rmse_original"] = float(best_val_rmse * max_value)
 
     # --------------------------------------------------------
     # Restore best validation checkpoint
@@ -771,22 +609,13 @@ def main():
     print("RESTORING BEST MODEL")
     print("=" * 70)
 
-    print(
-        "Best epoch :",
-        best_epoch + 1,
-    )
+    print("Best epoch :", best_epoch + 1)
+    print("Best validation RMSE :", best_val_rmse)
 
-    print(
-        "Best validation RMSE :",
-        best_val_rmse,
-    )
-
-    trainer.restore(
-        checkpoint_path
-    )
+    trainer.restore(checkpoint_path)
 
     # --------------------------------------------------------
-    # Final TEST evaluation
+    # Final TEST evaluation (exactly once)
     # --------------------------------------------------------
 
     print("\n")
@@ -794,74 +623,48 @@ def main():
     print("FINAL TEST EVALUATION")
     print("=" * 70)
 
+    assert "test_metrics" not in results, "Test set evaluated twice."
+
     test_targets, test_predictions = predict_dataset(
         trainer,
         model,
-        X_test,
-        y_test,
+        test_norm,
+        test_starts,
+        config,
     )
 
-    # --------------------------------------------------------
     # Inverse scaling
-    # --------------------------------------------------------
+    test_targets_original = test_targets * max_value
+    test_predictions_original = test_predictions * max_value
 
-    test_targets_original = (
-        test_targets * max_value
-    )
+    results["test_metrics"] = {
+        "rmse": float(rmse(test_targets_original, test_predictions_original)),
+        "mae": float(mae(test_targets_original, test_predictions_original)),
+        "r2": float(r2_score(test_targets_original, test_predictions_original)),
+        "accuracy": float(
+            accuracy(test_targets_original, test_predictions_original)
+        ),
+    }
 
-    test_predictions_original = (
-        test_predictions * max_value
-    )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
-    test_rmse = rmse(
-        test_targets_original,
-        test_predictions_original,
-    )
-
-    test_mae = mae(
-        test_targets_original,
-        test_predictions_original,
-    )
-
-    test_r2 = r2_score(
-        test_targets_original,
-        test_predictions_original,
-    )
-
-    test_accuracy = accuracy(
-        test_targets_original,
-        test_predictions_original,
-    )
-
-    print(
-        f"RMSE     : {test_rmse:.6f}"
-    )
-
-    print(
-        f"MAE      : {test_mae:.6f}"
-    )
-
-    print(
-        f"R2       : {test_r2:.6f}"
-    )
-
-    print(
-        f"Accuracy : {test_accuracy:.6f}"
-    )
-
-    # --------------------------------------------------------
-    # Close TensorFlow session
-    # --------------------------------------------------------
+    for name, value in results["test_metrics"].items():
+        print(f"{name.upper():9s}: {value:.6f}")
 
     trainer.close()
 
+    # --------------------------------------------------------
+    # Save results
+    # --------------------------------------------------------
+
+    results_path = run_dir / "results.json"
+
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\nResults saved to {results_path}")
+
     print("\n")
     print("=" * 70)
-    print("E2 COMPLETE")
+    print(f"{config.experiment} COMPLETE")
     print("=" * 70)
 
 
@@ -870,7 +673,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
-    print("DEBUG: calling main()")
 
     main()

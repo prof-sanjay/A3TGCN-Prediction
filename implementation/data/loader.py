@@ -122,12 +122,26 @@ def load_gba_dataset(
 
         # Load only the requested subset.
         # NaN values are intentionally preserved.
-        traffic = traffic_dataset[
-            :num_timesteps,
-            :num_nodes
-        ]
+        #
+        # The HDF5 data is float64. It is read in row chunks and
+        # cast to float32 chunk by chunk, so the full float64 copy
+        # (about 2 GB for the full GBA year) is never held in memory.
+        # The result is identical to casting the whole slice at once.
+        traffic = np.empty(
+            (num_timesteps, num_nodes),
+            dtype=np.float32,
+        )
 
-    traffic = np.asarray(traffic, dtype=np.float32)
+        chunk_rows = 8192
+
+        for start in range(0, num_timesteps, chunk_rows):
+
+            end = min(start + chunk_rows, num_timesteps)
+
+            traffic[start:end] = traffic_dataset[
+                start:end,
+                :num_nodes
+            ]
 
     # ---------------------------------------------------------
     # Load road-network adjacency
