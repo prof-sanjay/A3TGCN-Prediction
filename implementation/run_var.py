@@ -36,7 +36,7 @@ import numpy as np
 from config.config import ExperimentConfig
 from data.loader import load_gba_dataset
 from data.splitting import chronological_split
-from data.sensor_filter import duplicate_filter, select_sensors
+from data.sensor_filter import cached_duplicate_filter, select_sensors
 from causal.var import TopologyAwareVAR
 from causal.var_forecast import (
     residual_summary,
@@ -150,7 +150,10 @@ def main() -> None:
     val_end = train_end + len(val_data)
 
     if config.sensor_filter == "duplicates":
-        sensors, filter_report = duplicate_filter(train_data)
+        sensors, filter_report = cached_duplicate_filter(
+            train_data,
+            OUTPUT_ROOT.parent / "sensor_filter",
+        )
     else:
         sensors = np.arange(traffic.shape[1], dtype=np.int64)
         filter_report = {"rule": "none"}

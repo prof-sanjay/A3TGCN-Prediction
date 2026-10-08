@@ -72,7 +72,7 @@ from .data.windows import (
     missing_value_report,
 )
 from .data.sensor_filter import (
-    duplicate_filter,
+    cached_duplicate_filter,
     select_sensors,
 )
 from .data.imputation import (
@@ -396,7 +396,10 @@ def main():
 
     if config.sensor_filter == "duplicates":
 
-        sensors, filter_report = duplicate_filter(train_data)
+        sensors, filter_report = cached_duplicate_filter(
+            train_data,
+            Path(config.results_dir).parent / "outputs" / "sensor_filter",
+        )
 
         del train_data, val_data, test_data
 
