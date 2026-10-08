@@ -2,7 +2,8 @@
 Data-quality filter: sensors with duplicated (copied) series.
 
 LargeST-GBA contains groups of sensors whose training series are
-exactly identical - every value and every NaN position - although
+identical on every jointly observed timestep (copies that differ
+only in a few NaN positions), although
 the sensors lie on different freeways tens of kilometres apart.
 Such series cannot be independent measurements. They make local
 VAR regressions singular and give PEM degenerate covariances
@@ -22,15 +23,27 @@ import numpy as np
 
 def find_duplicate_sensor_groups(
     train_data: np.ndarray,
+    min_overlap: float = 0.5,
 ) -> list[list[int]]:
     """
-    Groups of sensors whose training series are exactly identical,
-    including the positions of their missing values.
+    Groups of sensors whose training series are identical on every
+    timestep at which BOTH sensors are observed.
+
+    Copies in LargeST-GBA sometimes differ only in a few NaN
+    positions, so equality is required on the jointly observed rows
+    rather than on the NaN pattern as well. Two sensors are linked
+    only if they are jointly observed on at least ``min_overlap`` of
+    the training rows; linked sensors are merged into groups
+    (connected components).
 
     Parameters
     ----------
     train_data:
         Training traffic with shape [time, nodes]. NaNs preserved.
+
+    min_overlap:
+        Minimum fraction of training rows on which both sensors of
+        a pair must be observed.
 
     Returns
     -------
@@ -45,26 +58,62 @@ def find_duplicate_sensor_groups(
             f"got {train_data.shape}"
         )
 
+    num_timesteps, num_sensors = train_data.shape
+
+    observed = np.isfinite(train_data)
+
+    # ---------------------------------------------------------
+    # Candidate pre-filter: sensors that are identical on every
+    # jointly observed row are also identical on the rows where
+    # ALL sensors are observed. Bucket on those rows, then verify
+    # every candidate pair exactly on its own jointly observed rows.
+    # ---------------------------------------------------------
+
+    all_observed = np.all(observed, axis=1)
+
     buckets: dict[bytes, list[int]] = {}
 
-    for sensor in range(train_data.shape[1]):
+    for sensor in range(num_sensors):
 
-        column = train_data[:, sensor]
-        missing = np.isnan(column)
-
-        # Exact key: the observed values (missing positions set to a
-        # fixed placeholder only inside this key) plus the missing
-        # pattern itself. The data array is not modified.
-        key = (
-            np.where(missing, 0.0, column).astype(np.float64).tobytes()
-            + missing.tobytes()
-        )
+        key = train_data[all_observed, sensor].tobytes()
 
         buckets.setdefault(key, []).append(sensor)
 
+    parent = list(range(num_sensors))
+
+    def find(sensor):
+
+        while parent[sensor] != sensor:
+            parent[sensor] = parent[parent[sensor]]
+            sensor = parent[sensor]
+
+        return sensor
+
+    for members in buckets.values():
+
+        for a_index, a in enumerate(members):
+
+            for b in members[a_index + 1:]:
+
+                both = observed[:, a] & observed[:, b]
+
+                if both.sum() < min_overlap * num_timesteps:
+                    continue
+
+                if np.array_equal(
+                    train_data[both, a],
+                    train_data[both, b],
+                ):
+                    parent[find(b)] = find(a)
+
+    components: dict[int, list[int]] = {}
+
+    for sensor in range(num_sensors):
+        components.setdefault(find(sensor), []).append(sensor)
+
     groups = [
         sorted(members)
-        for members in buckets.values()
+        for members in components.values()
         if len(members) > 1
     ]
 
@@ -100,7 +149,8 @@ def duplicate_filter(
 
     report = {
         "rule": "exclude every sensor whose training series is "
-                "identical (values and NaN positions) to another sensor",
+                "identical to another sensor on all jointly observed "
+                "rows (joint observation >= 50% of training rows)",
         "num_sensors_before": int(train_data.shape[1]),
         "num_groups": len(groups),
         "num_excluded": int(len(excluded)),
