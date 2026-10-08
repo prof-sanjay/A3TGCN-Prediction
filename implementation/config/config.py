@@ -61,6 +61,18 @@ class ExperimentConfig:
     num_timesteps: int = 105_120
     num_nodes: int = 2_352
 
+    # Data-quality filter (decision D9, defined on TRAIN only):
+    #   "duplicates" : drop sensors with copied series
+    #   "none"       : keep all sensors
+    sensor_filter: str = "duplicates"
+
+    # Missing values for A3T-GCN INPUTS (policy of 2026-10-08):
+    #   "gap_bands" : gap-length-band filling (data/imputation.py);
+    #                 targets must still be originally observed
+    #   "none"      : no filling; windows with any NaN excluded
+    imputation: str = "gap_bands"
+    imputation_neighbours: int = 5
+
     # Outputs: results/<experiment>/
     results_dir: str = str(IMPLEMENTATION_DIR / "results")
 
@@ -79,6 +91,18 @@ class ExperimentConfig:
         if self.experiment in ("E1", "E2") and self.graph_path is None:
             raise ValueError(
                 f"{self.experiment} requires graph_path."
+            )
+
+        if self.sensor_filter not in ("duplicates", "none"):
+            raise ValueError(
+                f"sensor_filter must be 'duplicates' or 'none', "
+                f"got {self.sensor_filter}"
+            )
+
+        if self.imputation not in ("gap_bands", "none"):
+            raise ValueError(
+                f"imputation must be 'gap_bands' or 'none', "
+                f"got {self.imputation}"
             )
 
     @property

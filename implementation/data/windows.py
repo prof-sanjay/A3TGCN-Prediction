@@ -177,6 +177,69 @@ def valid_window_starts(
     ).astype(np.int64)
 
 
+def valid_window_starts_from_rows(
+    input_row_ok: np.ndarray,
+    target_row_ok: np.ndarray,
+    seq_len: int,
+    pre_len: int,
+) -> np.ndarray:
+    """
+    Valid window starts when inputs and targets have separate
+    validity rules (used with gap-band filling):
+
+        input timesteps  s .. s + seq_len - 1
+            must be True in input_row_ok
+            (finite for every sensor AFTER filling)
+
+        target timesteps s + seq_len .. s + seq_len + pre_len - 1
+            must be True in target_row_ok
+            (OBSERVED for every sensor in the original data)
+
+    With input_row_ok == target_row_ok this is identical to
+    valid_window_starts().
+    """
+
+    input_row_ok = np.asarray(input_row_ok, dtype=bool)
+    target_row_ok = np.asarray(target_row_ok, dtype=bool)
+
+    if input_row_ok.shape != target_row_ok.shape:
+        raise ValueError("Row masks must have the same shape.")
+
+    if seq_len <= 0 or pre_len <= 0:
+        raise ValueError("seq_len and pre_len must be greater than zero.")
+
+    num_timesteps = len(input_row_ok)
+    window_length = seq_len + pre_len
+
+    if num_timesteps < window_length:
+        raise ValueError(
+            "Not enough timesteps to create a sequence: "
+            f"need at least {window_length}, got {num_timesteps}"
+        )
+
+    num_windows = num_timesteps - window_length + 1
+
+    def bad_counts(row_ok, offset, length):
+
+        cumulative = np.concatenate(
+            (
+                np.zeros(1, dtype=np.int64),
+                np.cumsum(~row_ok, dtype=np.int64),
+            )
+        )
+
+        first = np.arange(num_windows) + offset
+
+        return cumulative[first + length] - cumulative[first]
+
+    bad = (
+        bad_counts(input_row_ok, 0, seq_len)
+        + bad_counts(target_row_ok, seq_len, pre_len)
+    )
+
+    return np.flatnonzero(bad == 0).astype(np.int64)
+
+
 def gather_windows(
     data: np.ndarray,
     starts: np.ndarray,

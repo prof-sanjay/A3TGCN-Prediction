@@ -17,12 +17,27 @@ graph artifact with the keys:
     experiment  "E1" or "E2"
     train_end   number of training timesteps used to build the graph
     num_nodes   number of sensors
+    sensors     original GBA indices of the sensors (after filtering)
 
 VAR and PEM are therefore never executed inside this process, and
 E0 cannot use them by construction.
 
-Missing values are NOT imputed. A window is used only when every
-traffic value in its input and target is finite.
+Data handling (shared by E0 / E1 / E2, set in ExperimentConfig):
+
+    sensor_filter = "duplicates":
+        sensors with copied series (identified on TRAIN only) are
+        excluded (data/sensor_filter.py).
+
+    imputation = "gap_bands":
+        gap-length-band filling of A3T-GCN INPUTS
+        (data/imputation.py; look-ahead only inside TRAIN).
+        A window is used only when its inputs are finite after
+        filling AND its target timestep was originally observed for
+        every sensor, so every scored target is a real observation.
+
+    imputation = "none":
+        no filling; a window is used only when every value in its
+        input and target is finite.
 
 Run from the repository root:
 
@@ -51,9 +66,19 @@ from .data.preprocessing import (
     normalize_data,
 )
 from .data.windows import (
-    valid_window_starts,
+    finite_row_mask,
+    valid_window_starts_from_rows,
     iterate_window_batches,
     missing_value_report,
+)
+from .data.sensor_filter import (
+    duplicate_filter,
+    select_sensors,
+)
+from .data.imputation import (
+    fit_neighbour_models,
+    fill_split,
+    gap_length_counts,
 )
 
 from .models.a3tgcn import A3TGCNModel
@@ -113,7 +138,7 @@ def graph_statistics(adjacency):
     }
 
 
-def load_graph(config, road_adjacency, train_end):
+def load_graph(config, road_adjacency, train_end, sensors):
     """
     Return the adjacency matrix used by A3T-GCN.
 
@@ -122,7 +147,7 @@ def load_graph(config, road_adjacency, train_end):
 
     E1 / E2:
         Offline graph artifact. Its metadata must show that it was
-        built from exactly this training split.
+        built from exactly this training split and sensor set.
     """
 
     if config.experiment == "E0":
@@ -142,6 +167,14 @@ def load_graph(config, road_adjacency, train_end):
         graph_experiment = str(artifact["experiment"])
         graph_train_end = int(artifact["train_end"])
         graph_num_nodes = int(artifact["num_nodes"])
+        graph_sensors = np.asarray(artifact["sensors"], dtype=np.int64)
+
+    if not np.array_equal(graph_sensors, sensors):
+        raise ValueError(
+            "Graph artifact was built for a different sensor set "
+            f"({len(graph_sensors)} sensors) than this run "
+            f"({len(sensors)} sensors)."
+        )
 
     if graph_experiment != config.experiment:
         raise ValueError(
@@ -326,8 +359,6 @@ def main():
         num_nodes=config.num_nodes,
     )
 
-    num_nodes = traffic.shape[1]
-
     print(f"Traffic shape   : {traffic.shape} {traffic.dtype}")
     print(f"Adjacency shape : {road_adjacency.shape}")
 
@@ -354,6 +385,44 @@ def main():
         f"\nSplit rows: train [0, {train_end}), "
         f"val [{train_end}, {val_end}), "
         f"test [{val_end}, {len(traffic)})"
+    )
+
+    # --------------------------------------------------------
+    # Sensor filter (decision D9), defined on TRAIN rows only.
+    # Values are not modified; sensors are only selected.
+    # --------------------------------------------------------
+
+    if config.sensor_filter == "duplicates":
+
+        sensors, filter_report = duplicate_filter(train_data)
+
+        del train_data, val_data, test_data
+
+        traffic, road_adjacency = select_sensors(
+            traffic,
+            road_adjacency,
+            sensors,
+        )
+
+        train_data, val_data, test_data = chronological_split(
+            traffic,
+            config.train_rate,
+            config.val_rate,
+        )
+
+    else:
+
+        sensors = np.arange(traffic.shape[1], dtype=np.int64)
+        filter_report = {"rule": "none"}
+
+    num_nodes = traffic.shape[1]
+
+    results["sensor_filter"] = filter_report
+    results["sensors"] = sensors.tolist()
+
+    print(
+        f"Sensor filter ({config.sensor_filter}): "
+        f"{num_nodes} sensors used"
     )
 
     # --------------------------------------------------------
@@ -389,6 +458,7 @@ def main():
         config,
         road_adjacency,
         train_end,
+        sensors,
     )
 
     graph_info["statistics"] = graph_statistics(adjacency)
@@ -398,46 +468,121 @@ def main():
     print(f"Graph stats  : {graph_info['statistics']}")
 
     # --------------------------------------------------------
-    # Fit scaler on TRAIN data only, then normalize.
-    #
-    # The whole array is divided once and the splits are views,
-    # which gives exactly the same values as normalizing each
-    # split separately while avoiding extra copies.
+    # Fit scaler on observed TRAIN data only.
     # --------------------------------------------------------
 
     max_value = fit_max_scaler(train_data)
 
     print(f"\nTraining max value : {max_value}")
 
-    del train_data, val_data, test_data
-
-    traffic_norm = normalize_data(
-        traffic,
-        max_value,
-    )
-
-    del traffic
-
-    train_norm, val_norm, test_norm = chronological_split(
-        traffic_norm,
-        config.train_rate,
-        config.val_rate,
-    )
-
     results["max_value"] = max_value
 
+    # Target validity always refers to the ORIGINAL observations.
+    target_row_ok = {
+        "train": finite_row_mask(train_data),
+        "val": finite_row_mask(val_data),
+        "test": finite_row_mask(test_data),
+    }
+
+    if config.imputation == "gap_bands":
+
+        # ----------------------------------------------------
+        # Gap-band filling of A3T-GCN inputs. Neighbour models
+        # are fitted on observed TRAIN data; only the training
+        # split may look ahead. Each split is filled into a new
+        # array and then normalized in place (identical values
+        # to normalize_data, without a second copy).
+        # ----------------------------------------------------
+
+        print("\nFitting neighbour models on training data...")
+
+        neighbour_models = fit_neighbour_models(
+            train_data,
+            road_adjacency,
+            num_neighbours=config.imputation_neighbours,
+        )
+
+        imputation_report = {
+            "method": "gap_bands",
+            "num_neighbours": config.imputation_neighbours,
+            "sensors_with_neighbour_model": len(neighbour_models),
+        }
+
+        normalized = {}
+
+        for name, split, look_ahead in [
+            ("train", train_data, True),
+            ("val", val_data, False),
+            ("test", test_data, False),
+        ]:
+
+            filled, counts = fill_split(
+                split,
+                neighbour_models,
+                look_ahead,
+            )
+
+            filled /= max_value
+
+            normalized[name] = filled
+
+            imputation_report[name] = {
+                "gaps": gap_length_counts(split),
+                "filled": counts,
+            }
+
+            print(f"{name:5s}: filled {counts}")
+
+        del neighbour_models, train_data, val_data, test_data, traffic
+
+        train_norm = normalized.pop("train")
+        val_norm = normalized.pop("val")
+        test_norm = normalized.pop("test")
+
+    else:
+
+        # ----------------------------------------------------
+        # No filling. The whole array is divided once and the
+        # splits are views, which gives exactly the same values
+        # as normalizing each split separately.
+        # ----------------------------------------------------
+
+        imputation_report = {"method": "none"}
+
+        del train_data, val_data, test_data
+
+        traffic_norm = normalize_data(
+            traffic,
+            max_value,
+        )
+
+        del traffic
+
+        train_norm, val_norm, test_norm = chronological_split(
+            traffic_norm,
+            config.train_rate,
+            config.val_rate,
+        )
+
+    results["imputation"] = imputation_report
+
     # --------------------------------------------------------
-    # Valid windows (no imputation, windows with NaN excluded)
+    # Valid windows: inputs finite (after filling, if any) and
+    # target timestep originally observed for every sensor.
+    # Without filling this equals "no NaN anywhere in the window".
     # --------------------------------------------------------
 
-    train_starts = valid_window_starts(
-        train_norm, config.seq_len, config.pre_len
+    train_starts = valid_window_starts_from_rows(
+        finite_row_mask(train_norm), target_row_ok["train"],
+        config.seq_len, config.pre_len,
     )
-    val_starts = valid_window_starts(
-        val_norm, config.seq_len, config.pre_len
+    val_starts = valid_window_starts_from_rows(
+        finite_row_mask(val_norm), target_row_ok["val"],
+        config.seq_len, config.pre_len,
     )
-    test_starts = valid_window_starts(
-        test_norm, config.seq_len, config.pre_len
+    test_starts = valid_window_starts_from_rows(
+        finite_row_mask(test_norm), target_row_ok["test"],
+        config.seq_len, config.pre_len,
     )
 
     results["valid_sequences"] = {
