@@ -1,92 +1,74 @@
 """
-Production VAR residual generation for GBA traffic data.
+Topology-aware VAR on the LargeST-GBA TRAINING split (E1 / E2).
 
 Pipeline:
     GBA traffic + road-network adjacency
             ↓
-    Topology-aware VAR
+    Chronological split, sensor filter (shared ExperimentConfig)
             ↓
-    VAR coefficients
+    Topology-aware VAR fitted on TRAINING rows only
             ↓
-    Residuals + valid mask
+    VAR coefficients (+ training residuals and valid mask)
             ↓
-    Saved outputs for causal discovery
+    Out-of-sample one-step residuals on the VALIDATION split
+    (for lag-order / ridge selection; the test split is never read)
+            ↓
+    Saved outputs for the E1 graph and for PEM (E2)
+
+Missing values are NOT imputed. VAR uses observed values only:
+a regression sample is used only when its target and every lagged
+predictor are finite (the gap-band filling of A3T-GCN inputs is
+never applied here).
+
+Run from the implementation directory (traffic-gpu environment):
+
+    python run_var.py --lag 1 --alpha 1e-5
+    python run_var.py --lag 1 --alpha 1e4 --save-residuals
 """
 
+import argparse
 import json
 import time
 from pathlib import Path
 
-import h5py
 import numpy as np
 
+from config.config import ExperimentConfig
+from data.loader import load_gba_dataset
+from data.splitting import chronological_split
+from data.sensor_filter import duplicate_filter, select_sensors
 from causal.var import TopologyAwareVAR
+from causal.var_forecast import (
+    residual_summary,
+    var_one_step_residuals,
+)
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-TRAFFIC_FILE = Path(
-    r"C:\My Folder\Projects\Datasets\LargeSTGBA\gba_his_raw_2021.h5"
-)
+OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs" / "var_train"
 
-ADJACENCY_FILE = Path(
-    r"C:\My Folder\Projects\Datasets\LargeSTGBA\gba_rn_adj.npy"
-)
-
-OUTPUT_DIR = Path("outputs") / "var"
-
-# Controlled production run
-NUM_TIMESTEPS = 20_000
-NUM_NODES = 1_000
-
-LAG_ORDER = 1
-RIDGE_ALPHA = 1e-5
 USE_GPU = True
 
 
-# ============================================================
-# DATA LOADING
-# ============================================================
+def parse_args():
 
-def load_traffic(
-    traffic_file: Path,
-    num_timesteps: int,
-    num_nodes: int,
-) -> np.ndarray:
-    """
-    Load the requested GBA traffic subset.
-
-    No imputation or filling is performed.
-    Missing values remain NaN.
-    """
-
-    with h5py.File(traffic_file, "r") as f:
-        traffic = f["traffic"][
-            :num_timesteps,
-            :num_nodes,
-        ]
-
-    return np.asarray(traffic, dtype=np.float32)
-
-
-def load_adjacency(
-    adjacency_file: Path,
-    num_nodes: int,
-) -> np.ndarray:
-    """
-    Load the corresponding road-network adjacency subset.
-    """
-
-    adjacency = np.load(adjacency_file, mmap_mode="r")
-
-    adjacency = np.asarray(
-        adjacency[:num_nodes, :num_nodes],
-        dtype=np.float32,
+    parser = argparse.ArgumentParser(
+        description="Topology-aware VAR on the GBA training split."
     )
 
-    return adjacency
+    parser.add_argument("--lag", type=int, default=1)
+    parser.add_argument("--alpha", type=float, default=1e-5)
+
+    parser.add_argument(
+        "--save-residuals",
+        action="store_true",
+        help="Also save training residuals and valid mask (~0.9 GB).",
+    )
+
+    return parser.parse_args()
 
 
 # ============================================================
@@ -96,28 +78,22 @@ def load_adjacency(
 def save_results(
     output_dir: Path,
     result,
+    sensors: np.ndarray,
     metadata: dict,
+    save_residuals: bool,
 ) -> None:
     """
-    Save VAR outputs required by later causal-discovery stages.
+    Save VAR outputs required by later stages.
     """
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    np.save(
-        output_dir / "coefficients.npy",
-        result.coefficients,
-    )
+    np.save(output_dir / "coefficients.npy", result.coefficients)
+    np.save(output_dir / "sensors.npy", sensors)
 
-    np.save(
-        output_dir / "residuals.npy",
-        result.residuals,
-    )
-
-    np.save(
-        output_dir / "valid_mask.npy",
-        result.valid_mask,
-    )
+    if save_residuals:
+        np.save(output_dir / "residuals.npy", result.residuals)
+        np.save(output_dir / "valid_mask.npy", result.valid_mask)
 
     with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=4)
@@ -129,70 +105,85 @@ def save_results(
 
 def main() -> None:
 
+    args = parse_args()
+
+    config = ExperimentConfig()
+    config.validate()
+
+    output_dir = OUTPUT_ROOT / f"lag{args.lag}_alpha{args.alpha:g}"
+
     print("=" * 70)
-    print("PRODUCTION TOPOLOGY-AWARE VAR")
+    print("TOPOLOGY-AWARE VAR (TRAINING SPLIT)")
     print("=" * 70)
 
     print("\nConfiguration:")
-    print(f"  Traffic file : {TRAFFIC_FILE}")
-    print(f"  Adjacency    : {ADJACENCY_FILE}")
-    print(f"  Timesteps    : {NUM_TIMESTEPS}")
-    print(f"  Sensors      : {NUM_NODES}")
-    print(f"  Lag order    : {LAG_ORDER}")
-    print(f"  Ridge alpha  : {RIDGE_ALPHA}")
-    print(f"  GPU          : {USE_GPU}")
+    print(f"  Traffic file  : {config.traffic_path}")
+    print(f"  Adjacency     : {config.adjacency_path}")
+    print(f"  Sensor filter : {config.sensor_filter}")
+    print(f"  Lag order     : {args.lag}")
+    print(f"  Ridge alpha   : {args.alpha:g}")
+    print(f"  GPU           : {USE_GPU}")
+    print(f"  Output        : {output_dir}")
 
     # --------------------------------------------------------
-    # Check input files
-    # --------------------------------------------------------
-
-    if not TRAFFIC_FILE.exists():
-        raise FileNotFoundError(
-            f"Traffic file not found: {TRAFFIC_FILE}"
-        )
-
-    if not ADJACENCY_FILE.exists():
-        raise FileNotFoundError(
-            f"Adjacency file not found: {ADJACENCY_FILE}"
-        )
-
-    # --------------------------------------------------------
-    # Load data
+    # Load data, split, filter sensors (same as main.py)
     # --------------------------------------------------------
 
     print("\nLoading traffic data...")
 
     load_start = time.perf_counter()
 
-    traffic = load_traffic(
-        TRAFFIC_FILE,
-        NUM_TIMESTEPS,
-        NUM_NODES,
+    traffic, adjacency = load_gba_dataset(
+        config.traffic_path,
+        config.adjacency_path,
+        num_timesteps=config.num_timesteps,
+        num_nodes=config.num_nodes,
     )
 
-    adjacency = load_adjacency(
-        ADJACENCY_FILE,
-        NUM_NODES,
+    train_data, val_data, _ = chronological_split(
+        traffic,
+        config.train_rate,
+        config.val_rate,
     )
+
+    train_end = len(train_data)
+    val_end = train_end + len(val_data)
+
+    if config.sensor_filter == "duplicates":
+        sensors, filter_report = duplicate_filter(train_data)
+    else:
+        sensors = np.arange(traffic.shape[1], dtype=np.int64)
+        filter_report = {"rule": "none"}
+
+    # Keep only TRAIN and VALIDATION rows; the test rows are dropped
+    # here and never used by this script.
+    traffic, adjacency = select_sensors(
+        traffic[:val_end],
+        adjacency,
+        sensors,
+    )
+
+    train_data = traffic[:train_end]
+    val_data = traffic[train_end:val_end]
 
     load_time = time.perf_counter() - load_start
 
-    print(f"Traffic shape    : {traffic.shape}")
+    num_nodes = train_data.shape[1]
+
+    print(f"Training shape   : {train_data.shape}")
+    print(f"Validation shape : {val_data.shape}")
     print(f"Adjacency shape  : {adjacency.shape}")
     print(f"Loading time     : {load_time:.3f} seconds")
 
     # --------------------------------------------------------
-    # Missing-data diagnostics
+    # Missing-data diagnostics (training rows)
     # --------------------------------------------------------
 
-    missing_count = np.count_nonzero(~np.isfinite(traffic))
-    total_count = traffic.size
+    missing_count = np.count_nonzero(~np.isfinite(train_data))
+    total_count = train_data.size
+    missing_percentage = 100.0 * missing_count / total_count
 
-    missing_percentage = (
-        100.0 * missing_count / total_count
-    )
-
-    print("\nINPUT DATA")
+    print("\nINPUT DATA (training rows)")
     print(f"  Total values       : {total_count}")
     print(f"  Missing/non-finite : {missing_count}")
     print(f"  Missing percentage : {missing_percentage:.6f}%")
@@ -211,35 +202,25 @@ def main() -> None:
     print(f"  Self-loops       : {self_loops}")
 
     # --------------------------------------------------------
-    # Create VAR model
+    # Fit VAR on TRAINING rows only
     # --------------------------------------------------------
 
-    print("\nCreating topology-aware VAR model...")
+    print("\nFitting VAR on training rows...")
 
     model = TopologyAwareVAR(
-        lag_order=LAG_ORDER,
-        ridge_alpha=RIDGE_ALPHA,
+        lag_order=args.lag,
+        ridge_alpha=args.alpha,
         use_gpu=USE_GPU,
     )
-
-    # --------------------------------------------------------
-    # Fit VAR
-    # --------------------------------------------------------
-
-    print("\nFitting VAR...")
 
     start_time = time.perf_counter()
 
     result = model.fit(
-        data=traffic,
+        data=train_data,
         adjacency=adjacency,
     )
 
     runtime = time.perf_counter() - start_time
-
-    # --------------------------------------------------------
-    # Results
-    # --------------------------------------------------------
 
     print("\n" + "=" * 70)
     print("VAR RESULT")
@@ -256,88 +237,44 @@ def main() -> None:
     # Residual coverage
     # --------------------------------------------------------
 
-    valid_counts = np.sum(
-        result.valid_mask,
-        axis=0,
-    )
+    valid_counts = np.sum(result.valid_mask, axis=0)
 
-    coverage = (
-        valid_counts / NUM_TIMESTEPS
-    ) * 100.0
+    coverage = (valid_counts / train_end) * 100.0
 
-    print("\nRESIDUAL COVERAGE")
-
-    print(
-        f"  Minimum valid residuals : "
-        f"{valid_counts.min()}"
-    )
-
-    print(
-        f"  Maximum valid residuals : "
-        f"{valid_counts.max()}"
-    )
-
-    print(
-        f"  Mean valid residuals    : "
-        f"{valid_counts.mean():.3f}"
-    )
-
-    print(
-        f"  Minimum coverage (%)    : "
-        f"{coverage.min():.3f}"
-    )
-
-    print(
-        f"  Maximum coverage (%)    : "
-        f"{coverage.max():.3f}"
-    )
-
-    print(
-        f"  Mean coverage (%)       : "
-        f"{coverage.mean():.6f}"
-    )
+    print("\nRESIDUAL COVERAGE (training)")
+    print(f"  Minimum valid residuals : {valid_counts.min()}")
+    print(f"  Maximum valid residuals : {valid_counts.max()}")
+    print(f"  Mean valid residuals    : {valid_counts.mean():.3f}")
+    print(f"  Minimum coverage (%)    : {coverage.min():.3f}")
+    print(f"  Maximum coverage (%)    : {coverage.max():.3f}")
+    print(f"  Mean coverage (%)       : {coverage.mean():.6f}")
 
     # --------------------------------------------------------
-    # Residual statistics
+    # In-sample and out-of-sample residuals
     # --------------------------------------------------------
 
-    finite_residuals = result.residuals[
-        np.isfinite(result.residuals)
-    ]
+    train_summary = residual_summary(result.residuals)
 
-    print("\nRESIDUAL VALUES")
-
-    print(
-        f"  Finite residual values : "
-        f"{finite_residuals.size}"
+    val_residuals, _ = var_one_step_residuals(
+        val_data,
+        result.coefficients,
+        adjacency,
     )
 
+    val_summary = residual_summary(val_residuals)
+
+    del val_residuals
+
+    print("\nRESIDUALS (vehicles per 5 min)")
     print(
-        f"  NaN residual values    : "
-        f"{np.count_nonzero(~np.isfinite(result.residuals))}"
+        f"  Training   (in-sample)     : RMSE {train_summary['rmse']:.4f} | "
+        f"MAE {train_summary['mae']:.4f} | mean {train_summary['mean']:.4f}"
     )
-
-    if finite_residuals.size > 0:
-
-        print(
-            f"  Residual mean         : "
-            f"{finite_residuals.mean()}"
-        )
-
-        print(
-            f"  Residual std          : "
-            f"{finite_residuals.std()}"
-        )
-
-        print(
-            f"  Residual minimum      : "
-            f"{finite_residuals.min()}"
-        )
-
-        print(
-            f"  Residual maximum      : "
-            f"{finite_residuals.max()}"
-        )
+    print(
+        f"  Validation (out-of-sample) : RMSE {val_summary['rmse']:.4f} | "
+        f"MAE {val_summary['mae']:.4f} | mean {val_summary['mean']:.4f} | "
+        f"coverage {val_summary['coverage_percentage']:.3f}%"
+    )
 
     # --------------------------------------------------------
     # Coefficient statistics
@@ -345,65 +282,29 @@ def main() -> None:
 
     coefficients = result.coefficients
 
-    nonzero_coefficients = np.count_nonzero(
-        coefficients
-    )
+    nonzero_coefficients = np.count_nonzero(coefficients)
 
     print("\nCOEFFICIENTS")
-
-    print(
-        f"  Non-zero coefficients : "
-        f"{nonzero_coefficients}"
-    )
-
-    print(
-        f"  Minimum               : "
-        f"{coefficients.min()}"
-    )
-
-    print(
-        f"  Maximum               : "
-        f"{coefficients.max()}"
-    )
-
-    print(
-        f"  Mean                  : "
-        f"{coefficients.mean()}"
-    )
-
-    print(
-        f"  Std                   : "
-        f"{coefficients.std()}"
-    )
+    print(f"  Non-zero coefficients : {nonzero_coefficients}")
+    print(f"  Minimum               : {coefficients.min()}")
+    print(f"  Maximum               : {coefficients.max()}")
+    print(f"  Mean                  : {coefficients.mean()}")
+    print(f"  Std                   : {coefficients.std()}")
+    print(f"  Max |coefficient|     : {np.abs(coefficients).max()}")
 
     # --------------------------------------------------------
     # Topology consistency
     # --------------------------------------------------------
 
-    nonzero_adjacency = np.count_nonzero(
-        adjacency
+    allowed = (adjacency != 0) | np.eye(num_nodes, dtype=bool)
+
+    topology_preserved = bool(
+        np.all(result.coefficients[:, ~allowed] == 0)
     )
 
     print("\nTOPOLOGY CONSISTENCY")
-
-    print(
-        f"  Non-zero adjacency entries : "
-        f"{nonzero_adjacency}"
-    )
-
-    print(
-        f"  Non-zero VAR coefficients  : "
-        f"{nonzero_coefficients}"
-    )
-
-    topology_preserved = (
-        np.all(
-            result.coefficients[
-                :, adjacency == 0
-            ] == 0
-        )
-    )
-
+    print(f"  Non-zero adjacency entries : {nonzero_adjacency}")
+    print(f"  Non-zero VAR coefficients  : {nonzero_coefficients}")
     print(
         f"  Topology restriction       : "
         f"{'PRESERVED' if topology_preserved else 'VIOLATED'}"
@@ -414,48 +315,54 @@ def main() -> None:
     # --------------------------------------------------------
 
     metadata = {
-        "traffic_file": str(TRAFFIC_FILE),
-        "adjacency_file": str(ADJACENCY_FILE),
-        "num_timesteps": NUM_TIMESTEPS,
-        "num_nodes": NUM_NODES,
-        "lag_order": LAG_ORDER,
-        "ridge_alpha": RIDGE_ALPHA,
+        "traffic_file": str(config.traffic_path),
+        "adjacency_file": str(config.adjacency_path),
+        "train_rows": [0, train_end],
+        "val_rows": [train_end, val_end],
+        "train_end": train_end,
+        "sensor_filter": config.sensor_filter,
+        "num_sensors_excluded": int(
+            filter_report.get("num_excluded", 0)
+        ),
+        "num_nodes": int(num_nodes),
+        "lag_order": args.lag,
+        "ridge_alpha": args.alpha,
         "use_gpu": USE_GPU,
-        "traffic_shape": list(traffic.shape),
-        "adjacency_shape": list(adjacency.shape),
+        "imputation": "none (observed values only)",
         "coefficient_shape": list(result.coefficients.shape),
-        "residual_shape": list(result.residuals.shape),
-        "valid_mask_shape": list(result.valid_mask.shape),
+        "residuals_saved": bool(args.save_residuals),
         "runtime_seconds": runtime,
-        "runtime_minutes": runtime / 60.0,
-        "input_missing_count": int(missing_count),
-        "input_missing_percentage": float(missing_percentage),
+        "train_missing_count": int(missing_count),
+        "train_missing_percentage": float(missing_percentage),
         "mean_residual_coverage": float(coverage.mean()),
         "minimum_residual_coverage": float(coverage.min()),
-        "maximum_residual_coverage": float(coverage.max()),
+        "train_residuals": train_summary,
+        "val_residuals": val_summary,
+        "max_abs_coefficient": float(np.abs(coefficients).max()),
         "nonzero_adjacency": int(nonzero_adjacency),
         "nonzero_coefficients": int(nonzero_coefficients),
-        "topology_restriction_preserved": bool(
-            topology_preserved
-        ),
+        "topology_restriction_preserved": topology_preserved,
     }
 
     save_results(
-        OUTPUT_DIR,
+        output_dir,
         result,
+        sensors,
         metadata,
+        args.save_residuals,
     )
 
     print("\nOUTPUTS SAVED")
-
-    print(f"  Directory      : {OUTPUT_DIR}")
+    print(f"  Directory      : {output_dir}")
     print("  coefficients   : coefficients.npy")
-    print("  residuals      : residuals.npy")
-    print("  valid mask     : valid_mask.npy")
+    print("  sensors        : sensors.npy")
+    if args.save_residuals:
+        print("  residuals      : residuals.npy")
+        print("  valid mask     : valid_mask.npy")
     print("  metadata       : metadata.json")
 
     print("\n" + "=" * 70)
-    print("PRODUCTION VAR RUN COMPLETE")
+    print("VAR RUN COMPLETE")
     print("=" * 70)
 
 
