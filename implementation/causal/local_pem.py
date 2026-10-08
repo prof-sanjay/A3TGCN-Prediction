@@ -98,6 +98,7 @@ class LocalPEM:
         tolerance: float = 1e-6,
         spectral_norm_bound: float | None = None,
         prior_inclusion: float = 0.5,
+        optimizer: str = "SLSQP",
     ) -> None:
 
         if not 0.0 < prior_inclusion < 1.0:
@@ -107,6 +108,7 @@ class LocalPEM:
 
         self.units = units
         self.prior_inclusion = float(prior_inclusion)
+        self.optimizer = optimizer
 
         self.nu0 = nu0
         self.nu1 = nu1
@@ -216,6 +218,7 @@ class LocalPEM:
             max_iter=self.max_iter,
             tolerance=self.tolerance,
             spectral_norm_bound=self.spectral_norm_bound,
+            optimizer=self.optimizer,
         )
 
         return model.fit(local_residuals)

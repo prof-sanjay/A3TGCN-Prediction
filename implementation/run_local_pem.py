@@ -77,7 +77,14 @@ def parse_args():
     parser.add_argument("--tau", type=float, default=0.01)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--prior-inclusion", type=float, default=0.5)
-    parser.add_argument("--max-iter", type=int, default=500)
+    # Optimizer for the unchanged PEM-MAP objective (decision D4).
+    # SLSQP is the original solver but is infeasible for large units;
+    # L-BFGS-B with the same objective-value accuracy (tolerance is
+    # converted to L-BFGS-B's relative ftol inside PEM) gives the same
+    # graphs and causal orders (test_pem_speedup.py, part 5).
+    parser.add_argument("--optimizer", default="L-BFGS-B",
+                        choices=["L-BFGS-B", "SLSQP"])
+    parser.add_argument("--max-iter", type=int, default=20000)
     parser.add_argument("--tolerance", type=float, default=1e-6)
 
     parser.add_argument("--workers", type=int, default=10)
@@ -106,6 +113,7 @@ def settings_tag(args):
         f"{args.var_run}"
         f"__nu0_{args.nu0:g}_nu1_{args.nu1:g}_tau_{args.tau:g}"
         f"_thr_{args.threshold:g}_eta_{args.prior_inclusion:g}"
+        f"_{args.optimizer}"
     )
 
 
@@ -302,6 +310,7 @@ def main():
         "max_iter": args.max_iter,
         "tolerance": args.tolerance,
         "prior_inclusion": args.prior_inclusion,
+        "optimizer": args.optimizer,
     }
 
     sizes = np.array([len(units[i].nodes) for i in indices])

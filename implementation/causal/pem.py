@@ -67,6 +67,7 @@ class PEM:
         max_iter: int = 500,
         tolerance: float = 1e-6,
         spectral_norm_bound: float | None = None,
+        optimizer: str = "SLSQP",
     ) -> None:
 
         if nu0 <= 0:
@@ -114,6 +115,22 @@ class PEM:
         self.threshold = float(threshold)
         self.max_iter = int(max_iter)
         self.tolerance = float(tolerance)
+
+        # Numerical optimizer for the (unchanged) PEM-MAP objective.
+        # "SLSQP" is the original choice. "L-BFGS-B" minimises the
+        # same objective with the same exact gradient; it supports no
+        # general constraints, so it requires spectral_norm_bound=None.
+        if optimizer not in ("SLSQP", "L-BFGS-B"):
+            raise ValueError(
+                "optimizer must be 'SLSQP' or 'L-BFGS-B'."
+            )
+
+        if optimizer == "L-BFGS-B" and spectral_norm_bound is not None:
+            raise ValueError(
+                "L-BFGS-B cannot enforce spectral_norm_bound."
+            )
+
+        self.optimizer = optimizer
 
         self.spectral_norm_bound = (
             None
@@ -939,17 +956,36 @@ class PEM:
                 }
             )
 
+        if self.optimizer == "SLSQP":
+
+            options = {
+                "maxiter": self.max_iter,
+                "ftol": self.tolerance,
+                "disp": False,
+            }
+
+        else:
+
+            # SLSQP's ftol is an accuracy on the objective VALUE,
+            # whereas L-BFGS-B's ftol is RELATIVE to |f|. The same
+            # value accuracy is obtained by dividing by the initial
+            # objective magnitude.
+            initial_value = abs(objective(initial_parameters)[0])
+
+            options = {
+                "maxiter": self.max_iter,
+                "maxfun": 10 * self.max_iter,
+                "ftol": self.tolerance / max(1.0, initial_value),
+                "gtol": 0.0,
+            }
+
         result = minimize(
             objective,
             initial_parameters,
             jac=True,
-            method="SLSQP",
-            constraints=constraints,
-            options={
-                "maxiter": self.max_iter,
-                "ftol": self.tolerance,
-                "disp": False,
-            },
+            method=self.optimizer,
+            constraints=constraints if self.optimizer == "SLSQP" else (),
+            options=options,
         )
 
         if not result.success:

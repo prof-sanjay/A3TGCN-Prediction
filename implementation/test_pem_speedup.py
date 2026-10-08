@@ -208,6 +208,57 @@ def test_full_fits(BaselinePEM):
           "and precision within tolerance")
 
 
+def test_lbfgsb_vs_slsqp():
+    """
+    Decision D4: the same PEM-MAP objective minimised with L-BFGS-B
+    (same objective-value accuracy as SLSQP) must reach an objective no
+    worse than SLSQP (1e-8 relative) with the same graph and order.
+    """
+
+    print("\n5. OPTIMIZER: L-BFGS-B vs SLSQP, same objective")
+
+    rng = np.random.default_rng(2)
+
+    print(f"  {'p':>3s} {'adjacency':>10s} {'order':>6s} {'max|dP|':>9s} "
+          f"{'obj SLSQP':>14s} {'obj L-BFGS-B':>14s} "
+          f"{'t SLSQP':>8s} {'t L-BFGS-B':>10s}")
+
+    for p in (6, 10, 16, 24):
+
+        X = generate_dag_data(rng, p, 20000)
+
+        eta = np.full((p, p), 0.5)
+        np.fill_diagonal(eta, 0.0)
+
+        slsqp = PEM(eta)
+        start = time.perf_counter()
+        a = slsqp.fit(X)
+        t_a = time.perf_counter() - start
+
+        start = time.perf_counter()
+        b = PEM(eta, optimizer="L-BFGS-B",
+                max_iter=20000).fit(X)
+        t_b = time.perf_counter() - start
+
+        S = slsqp._make_positive_definite(slsqp._sample_covariance(X))
+        obj_a = slsqp._map_objective(a.precision_matrix, S, eta, len(X))
+        obj_b = slsqp._map_objective(b.precision_matrix, S, eta, len(X))
+
+        same_adjacency = np.array_equal(a.adjacency_matrix, b.adjacency_matrix)
+        same_order = a.causal_order == b.causal_order
+        d_prob = np.abs(a.inclusion_probabilities - b.inclusion_probabilities).max()
+
+        print(f"  {p:3d} {str(same_adjacency):>10s} {str(same_order):>6s} "
+              f"{d_prob:9.1e} {obj_a:14.4f} {obj_b:14.4f} "
+              f"{t_a:7.2f}s {t_b:9.2f}s")
+
+        assert same_adjacency and same_order
+        assert obj_b <= obj_a + 1e-8 * abs(obj_a)
+        assert d_prob < 1e-2
+
+    print("  [PASS] same graphs and orders; L-BFGS-B objective no worse than SLSQP (1e-8 rel.)")
+
+
 def main():
 
     print("=" * 70)
@@ -220,6 +271,7 @@ def main():
     test_objective_and_precision(BaselinePEM)
     test_gradient()
     test_full_fits(BaselinePEM)
+    test_lbfgsb_vs_slsqp()
 
     print("\n" + "=" * 70)
     print("ALL PEM SPEED-UP TESTS PASSED")

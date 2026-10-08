@@ -54,7 +54,8 @@ def main():
 
     pem_kwargs = {
         "nu0": 0.05, "nu1": 1.0, "tau": 0.01, "threshold": 0.5,
-        "max_iter": 500, "tolerance": 1e-6, "prior_inclusion": 0.5,
+        "max_iter": 20000, "tolerance": 1e-6, "prior_inclusion": 0.5,
+        "optimizer": "L-BFGS-B",
     }
 
     # Reference: one LocalPEM.fit over all units (original path).
