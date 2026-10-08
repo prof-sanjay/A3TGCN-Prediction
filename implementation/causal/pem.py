@@ -552,34 +552,222 @@ class PEM:
             )
         )
 
-        prior = 0.0
+        # Diagonal prior from PEM.
+        prior = self.tau * np.trace(precision)
 
-        num_nodes = precision.shape[0]
+        # Off-diagonal spike-and-slab penalty, summed over j < k.
+        # Vectorized form of _off_diagonal_penalty(); same formula.
+        upper = np.triu_indices(precision.shape[0], k=1)
 
-        for j in range(num_nodes):
-
-            # Diagonal prior from PEM.
-            prior += (
-                self.tau
-                * precision[j, j]
+        prior += np.sum(
+            -self._log_prior_density_array(
+                precision[upper],
+                eta[upper],
             )
-
-            for k in range(j + 1, num_nodes):
-
-                prior += (
-                    self._off_diagonal_penalty(
-                        precision[j, k],
-                        eta[j, k],
-                    )
-                )
+        )
 
         return float(
             likelihood + prior
         )
 
     # ------------------------------------------------------------------
+    # Vectorized prior and exact gradient (computational only)
+    #
+    # These evaluate exactly the same PEM-MAP objective as above; they
+    # only remove Python loops and supply the analytic gradient to the
+    # optimizer instead of a finite-difference approximation.
+    # ------------------------------------------------------------------
+
+    def _log_prior_density_array(
+        self,
+        values: np.ndarray,
+        eta: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Element-wise _log_prior_density().
+        """
+
+        abs_values = np.abs(values)
+
+        log_spike_only = -abs_values / self.nu0 - np.log(2.0 * self.nu0)
+        log_slab_only = -abs_values / self.nu1 - np.log(2.0 * self.nu1)
+
+        mixed = (eta > 0.0) & (eta < 1.0)
+
+        safe_eta = np.where(mixed, eta, 0.5)
+
+        log_mixture = np.logaddexp(
+            np.log1p(-safe_eta) + log_spike_only,
+            np.log(safe_eta) + log_slab_only,
+        )
+
+        return np.where(
+            eta <= 0.0,
+            log_spike_only,
+            np.where(
+                eta >= 1.0,
+                log_slab_only,
+                log_mixture,
+            ),
+        )
+
+    def _off_diagonal_penalty_derivative(
+        self,
+        values: np.ndarray,
+        eta: np.ndarray,
+    ) -> np.ndarray:
+        """
+        d/dv of the negative log spike-and-slab prior:
+
+            sign(v) * ( w_spike / nu0 + w_slab / nu1 )
+
+        with w_slab the posterior slab weight (the PEM posterior
+        inclusion probability) and w_spike = 1 - w_slab.
+        """
+
+        abs_values = np.abs(values)
+
+        mixed = (eta > 0.0) & (eta < 1.0)
+
+        safe_eta = np.where(mixed, eta, 0.5)
+
+        log_spike = (
+            np.log1p(-safe_eta)
+            - np.log(2.0 * self.nu0)
+            - abs_values / self.nu0
+        )
+
+        log_slab = (
+            np.log(safe_eta)
+            - np.log(2.0 * self.nu1)
+            - abs_values / self.nu1
+        )
+
+        slab_weight = np.exp(
+            log_slab - np.logaddexp(log_spike, log_slab)
+        )
+
+        slab_weight = np.where(
+            eta <= 0.0,
+            0.0,
+            np.where(eta >= 1.0, 1.0, slab_weight),
+        )
+
+        slope = (
+            (1.0 - slab_weight) / self.nu0
+            + slab_weight / self.nu1
+        )
+
+        return np.sign(values) * slope
+
+    def _objective_and_gradient(
+        self,
+        parameters: np.ndarray,
+        covariance: np.ndarray,
+        eta: np.ndarray,
+        num_samples: int,
+        num_nodes: int,
+    ) -> tuple[float, np.ndarray]:
+        """
+        PEM-MAP objective and its exact gradient with respect to the
+        Cholesky parameters used by _vector_to_precision().
+
+        With Omega = L L^T and f(Omega) the objective,
+
+            dF/dOmega = n/2 (S - Omega^{-1}) + tau I + P,
+            P[j,k] = P[k,j] = 0.5 * penalty'(Omega[j,k]),  j != k
+
+            dF/dL = 2 dF/dOmega L          (lower triangle)
+
+            diagonal: L[j,j] = exp(theta_j)
+                dF/dtheta_j = dF/dL[j,j] * L[j,j]
+                (0 where the exp() argument is clipped)
+        """
+
+        lower = self._vector_to_lower(parameters, num_nodes)
+
+        precision = lower @ lower.T
+        precision = (precision + precision.T) / 2.0
+
+        value = self._map_objective(
+            precision,
+            covariance,
+            eta,
+            num_samples,
+        )
+
+        if value >= 1e100:
+            return value, np.zeros_like(parameters)
+
+        inverse = np.linalg.inv(precision)
+        inverse = (inverse + inverse.T) / 2.0
+
+        gradient_omega = (
+            0.5 * num_samples * (covariance - inverse)
+            + self.tau * np.eye(num_nodes)
+        )
+
+        upper = np.triu_indices(num_nodes, k=1)
+
+        half_slope = 0.5 * self._off_diagonal_penalty_derivative(
+            precision[upper],
+            eta[upper],
+        )
+
+        gradient_omega[upper] += half_slope
+        gradient_omega[(upper[1], upper[0])] += half_slope
+
+        gradient_lower = 2.0 * gradient_omega @ lower
+
+        rows, cols = np.tril_indices(num_nodes)
+
+        gradient = gradient_lower[rows, cols].copy()
+
+        diagonal = rows == cols
+
+        clipped = np.abs(parameters[diagonal]) > 30.0
+
+        gradient[diagonal] = np.where(
+            clipped,
+            0.0,
+            gradient[diagonal] * lower[rows[diagonal], cols[diagonal]],
+        )
+
+        return value, gradient
+
+    # ------------------------------------------------------------------
     # Cholesky parameterization
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _vector_to_lower(
+        parameters: np.ndarray,
+        num_nodes: int,
+    ) -> np.ndarray:
+        """
+        Lower-triangular Cholesky factor from unconstrained
+        parameters (row-major lower triangle: (0,0), (1,0), (1,1),
+        (2,0), ...). Diagonal entries are exp(clip(value, -30, 30)).
+        """
+
+        lower = np.zeros(
+            (num_nodes, num_nodes),
+            dtype=np.float64,
+        )
+
+        rows, cols = np.tril_indices(num_nodes)
+
+        values = np.asarray(parameters, dtype=np.float64).copy()
+
+        diagonal = rows == cols
+
+        values[diagonal] = np.exp(
+            np.clip(values[diagonal], -30.0, 30.0)
+        )
+
+        lower[rows, cols] = values
+
+        return lower
 
     @staticmethod
     def _vector_to_precision(
@@ -596,30 +784,10 @@ class PEM:
         using exp().
         """
 
-        lower = np.zeros(
-            (num_nodes, num_nodes),
-            dtype=np.float64,
+        lower = PEM._vector_to_lower(
+            parameters,
+            num_nodes,
         )
-
-        index = 0
-
-        for j in range(num_nodes):
-
-            for k in range(j + 1):
-
-                value = parameters[index]
-                index += 1
-
-                if j == k:
-                    lower[j, k] = np.exp(
-                        np.clip(
-                            value,
-                            -30.0,
-                            30.0,
-                        )
-                    )
-                else:
-                    lower[j, k] = value
 
         precision = (
             lower @ lower.T
@@ -728,18 +896,14 @@ class PEM:
 
         def objective(parameters):
 
-            precision = (
-                self._vector_to_precision(
-                    parameters,
-                    num_nodes,
-                )
-            )
-
-            return self._map_objective(
-                precision,
+            # Same PEM-MAP objective, returned together with its
+            # exact gradient (instead of a finite-difference one).
+            return self._objective_and_gradient(
+                parameters,
                 covariance,
                 eta,
                 num_samples,
+                num_nodes,
             )
 
         constraints = []
@@ -778,6 +942,7 @@ class PEM:
         result = minimize(
             objective,
             initial_parameters,
+            jac=True,
             method="SLSQP",
             constraints=constraints,
             options={
