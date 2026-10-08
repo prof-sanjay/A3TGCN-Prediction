@@ -305,6 +305,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--selection-only",
+        action="store_true",
+        help="Model selection run: train + validate only, the test "
+             "set is NOT evaluated.",
+    )
+
+    parser.add_argument(
         "--run-name",
         default=None,
         help="Output folder under results/ (default: experiment).",
@@ -342,6 +349,7 @@ def main():
         "run_dir": str(run_dir),
         "config": asdict(config),
         "epochs_overridden": args.epochs is not None,
+        "selection_only": args.selection_only,
     }
 
     print("=" * 70)
@@ -767,6 +775,23 @@ def main():
     print("Best validation RMSE :", best_val_rmse)
 
     trainer.restore(checkpoint_path)
+
+    if args.selection_only:
+
+        # Model-selection run: the test set is never evaluated.
+        trainer.close()
+
+        results["test_metrics"] = "not evaluated (selection run)"
+
+        results_path = run_dir / "results.json"
+
+        with open(results_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+
+        print("\nSelection run: test set NOT evaluated.")
+        print(f"Results saved to {results_path}")
+
+        return
 
     # --------------------------------------------------------
     # Final TEST evaluation (exactly once)
