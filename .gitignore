@@ -7,3 +7,6 @@ results/
 
 # Datasets (if you don't want them in Git)
 datasets/
+# Run outputs (checkpoints, predictions)
+artifacts/
+outputs/
