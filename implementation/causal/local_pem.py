@@ -221,7 +221,11 @@ class LocalPEM:
             optimizer=self.optimizer,
         )
 
-        return model.fit(local_residuals)
+        result = model.fit(local_residuals)
+
+        self.slsqp_retries = getattr(self, "slsqp_retries", 0) + model.slsqp_retries
+
+        return result
 
     def fit(
         self,

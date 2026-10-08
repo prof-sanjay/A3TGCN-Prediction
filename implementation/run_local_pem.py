@@ -157,13 +157,18 @@ def run_unit(
 
     status = "ok"
     message = ""
+    slsqp_retries = 0
 
     try:
 
-        result = LocalPEM(
+        local_pem = LocalPEM(
             units=[local_unit],
             **pem_kwargs,
-        ).fit(local_residuals)
+        )
+
+        result = local_pem.fit(local_residuals)
+
+        slsqp_retries = int(getattr(local_pem, "slsqp_retries", 0))
 
         probabilities = result.global_inclusion_probabilities
         adjacency = result.global_adjacency
@@ -199,6 +204,7 @@ def run_unit(
         causal_order=causal_order,
         complete_rows=complete_rows,
         seconds=seconds,
+        slsqp_retries=slsqp_retries,
         status=status,
         message=message,
     )
@@ -410,6 +416,8 @@ def main():
                 "seconds": float(unit["seconds"]),
                 "complete_rows": int(unit["complete_rows"]),
                 "edges": int(np.count_nonzero(unit["adjacency"])),
+                "slsqp_retries": int(unit["slsqp_retries"])
+                if "slsqp_retries" in unit.files else 0,
                 "message": str(unit["message"]),
             })
 
@@ -430,6 +438,12 @@ def main():
         "wall_seconds_this_call": wall_seconds,
         "cpu_seconds_all_units": float(sum(r["seconds"] for r in records)),
         "failed_units": failed,
+        "units_with_slsqp_retry": int(
+            sum(1 for r in records if r["slsqp_retries"] > 0)
+        ),
+        "slsqp_retries_total": int(
+            sum(r["slsqp_retries"] for r in records)
+        ),
         "too_few_samples_units": [r["unit_index"] for r in too_few],
         "local_edge_density": float(
             sum(r["edges"] for r in records)
@@ -441,6 +455,9 @@ def main():
     print(f"  Units ok / failed / too few samples : "
           f"{len(records) - len(failed) - len(too_few)} / {len(failed)} / "
           f"{len(too_few)}")
+    print(f"  Units with SLSQP retry              : "
+          f"{summary['units_with_slsqp_retry']} "
+          f"({summary['slsqp_retries_total']} optimizations)")
     print(f"  CPU seconds (sum over units)        : "
           f"{summary['cpu_seconds_all_units']:.0f}")
     print(f"  Wall seconds (this call)            : {wall_seconds:.0f}")

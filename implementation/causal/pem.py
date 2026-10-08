@@ -132,6 +132,9 @@ class PEM:
 
         self.optimizer = optimizer
 
+        # Number of L-BFGS-B failures re-solved with SLSQP (reported).
+        self.slsqp_retries = 0
+
         self.spectral_norm_bound = (
             None
             if spectral_norm_bound is None
@@ -987,6 +990,26 @@ class PEM:
             constraints=constraints if self.optimizer == "SLSQP" else (),
             options=options,
         )
+
+        if not result.success and self.optimizer == "L-BFGS-B":
+
+            # L-BFGS-B can stop with a line-search failure. The same
+            # objective is then minimised with the original SLSQP
+            # solver, warm-started at the L-BFGS-B point. The count is
+            # kept so that it can be reported.
+            self.slsqp_retries += 1
+
+            result = minimize(
+                objective,
+                result.x,
+                jac=True,
+                method="SLSQP",
+                options={
+                    "maxiter": self.max_iter,
+                    "ftol": self.tolerance,
+                    "disp": False,
+                },
+            )
 
         if not result.success:
             raise RuntimeError(
