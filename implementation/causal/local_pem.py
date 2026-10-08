@@ -97,9 +97,16 @@ class LocalPEM:
         max_iter: int = 500,
         tolerance: float = 1e-6,
         spectral_norm_bound: float | None = None,
+        prior_inclusion: float = 0.5,
     ) -> None:
 
+        if not 0.0 < prior_inclusion < 1.0:
+            raise ValueError(
+                "prior_inclusion must be strictly between 0 and 1."
+            )
+
         self.units = units
+        self.prior_inclusion = float(prior_inclusion)
 
         self.nu0 = nu0
         self.nu1 = nu1
@@ -171,8 +178,8 @@ class LocalPEM:
         """
         Run the existing PEM implementation on one local unit.
 
-        A uniform prior is used here because this class is the
-        local PEM execution layer. Construction of informative
+        A uniform prior eta = prior_inclusion (default 0.5) is used
+        here because this class is the local PEM execution layer. Construction of informative
         eta values is kept separate.
 
         Returns
@@ -191,7 +198,7 @@ class LocalPEM:
 
         eta = np.full(
             (num_variables, num_variables),
-            0.5,
+            self.prior_inclusion,
             dtype=np.float64,
         )
 
