@@ -99,6 +99,13 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42)
 
+    parser.add_argument(
+        "--row-start", type=int, default=None,
+        help="Use only training residual rows [row-start, row-end) "
+             "(split-half stability checks; still training data).",
+    )
+    parser.add_argument("--row-end", type=int, default=None)
+
     parser.add_argument("--tag", default=None,
                         help="Output folder name (default from settings).")
 
@@ -264,6 +271,9 @@ def main():
     if residuals.shape != (var_metadata["train_end"], len(sensors)):
         raise ValueError("Residuals do not match the VAR metadata.")
 
+    row_slice = slice(args.row_start, args.row_end)
+    row_range = range(residuals.shape[0])[row_slice]
+
     full_adjacency = np.load(config.adjacency_path, mmap_mode="r")
 
     adjacency = np.asarray(
@@ -298,6 +308,9 @@ def main():
     if args.sample_units is not None:
         tag += f"__sample{args.sample_units}_seed{args.seed}"
 
+    if args.row_start is not None or args.row_end is not None:
+        tag += f"__rows{row_range.start}-{row_range.stop}"
+
     output_dir = PEM_ROOT / tag
     unit_dir = output_dir / "units"
     unit_dir.mkdir(parents=True, exist_ok=True)
@@ -319,7 +332,8 @@ def main():
     print("LOCAL PEM ON VAR TRAINING RESIDUALS")
     print("=" * 70)
     print(f"VAR run        : {args.var_run}")
-    print(f"Residuals      : {residuals.shape}")
+    print(f"Residuals      : {residuals.shape}, rows used "
+          f"[{row_range.start}, {row_range.stop})")
     print(f"Units selected : {len(indices)} of {len(units)}")
     print(f"Unit sizes     : min {sizes.min()}, median {np.median(sizes):.0f}, "
           f"max {sizes.max()}")
@@ -345,7 +359,9 @@ def main():
                 i,
                 int(units[i].target),
                 nodes,
-                np.ascontiguousarray(residuals[:, nodes], dtype=np.float64),
+                np.ascontiguousarray(
+                    residuals[row_slice, nodes], dtype=np.float64
+                ),
                 pem_kwargs,
                 str(unit_dir / f"unit_{i:05d}.npz"),
             )
@@ -410,6 +426,7 @@ def main():
         "units_skipped_too_large": skipped_large,
         "sample_units": args.sample_units,
         "seed": args.seed,
+        "rows": [row_range.start, row_range.stop],
         "wall_seconds_this_call": wall_seconds,
         "cpu_seconds_all_units": float(sum(r["seconds"] for r in records)),
         "failed_units": failed,
@@ -434,7 +451,9 @@ def main():
     # Aggregate into the global P and D (full runs only)
     # --------------------------------------------------------
 
-    if args.sample_units is None and args.max_unit_size is None:
+    full_rows = len(row_range) == residuals.shape[0]
+
+    if args.sample_units is None and args.max_unit_size is None and full_rows:
 
         if failed and not args.allow_failed:
             print(f"\n{len(failed)} failed units: aggregation skipped "
