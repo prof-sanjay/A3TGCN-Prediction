@@ -13,7 +13,7 @@ The E1 / E2 graphs are built OFFLINE from the TRAINING split only
 (VAR: run_var.py, PEM: run_local_pem.py) and passed in as an .npz
 graph artifact with the keys:
 
-    adjacency   float array (num_nodes, num_nodes)
+    adjacency   float array (num_nodes, num_nodes), G[target, source]
     experiment  "E1" or "E2"
     train_end   number of training timesteps used to build the graph
     num_nodes   number of sensors
@@ -80,6 +80,8 @@ from .data.imputation import (
     fill_split,
     gap_length_counts,
 )
+
+from .causal.graph_builders import to_model_orientation
 
 from .models.a3tgcn import A3TGCNModel
 
@@ -462,6 +464,10 @@ def main():
     )
 
     graph_info["statistics"] = graph_statistics(adjacency)
+    graph_info["orientation"] = (
+        "stored as G[target, source]; transposed once for A3T-GCN "
+        "(decision D2, identical for E0/E1/E2)"
+    )
     results["graph"] = graph_info
 
     print(f"\nGraph source : {graph_info['source']}")
@@ -609,7 +615,7 @@ def main():
         num_nodes=num_nodes,
         gru_units=config.gru_units,
         pre_len=config.pre_len,
-        adjacency=adjacency,
+        adjacency=to_model_orientation(adjacency),
         lambda_loss=config.lambda_loss,
     )
 
